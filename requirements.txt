@@ -4,3 +4,5 @@ pandas
 pyarrow
 fastparquet
 datetime
+psycopg2
+sqlalchemy
