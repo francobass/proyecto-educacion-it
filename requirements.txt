@@ -1,0 +1,8 @@
+requests
+bs4
+pandas
+pyarrow
+fastparquet
+datetime
+psycopg2
+sqlalchemy
