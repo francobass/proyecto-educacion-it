@@ -6,3 +6,4 @@ fastparquet
 datetime
 psycopg2
 sqlalchemy
+boto3
