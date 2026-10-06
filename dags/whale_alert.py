@@ -1,17 +1,33 @@
-from airflow.sdk import DAG
-from airflow.providers.standard.operators.empty import EmptyOperator
-from airflow.providers.standard.operators.python import PythonOperator
-import requests
-import boto3
+"""DAG Whale Alert escrito de la forma "clásica" (with DAG + PythonOperator).
+
+Flujo:
+    start_task -> extract -> transform_and_load -> end_task
+
+    extract            -> descarga el HTML de whale-alert.io y lo guarda en MinIO (capa raw)
+    transform_and_load -> lee el HTML de MinIO, arma una tabla y la carga en PostgreSQL
+
+Las tareas se pasan datos por XCom: lo que devuelve extract se lee con xcom_pull.
+"""
+
 import datetime
-import os
 import io
 import logging
-from bs4 import BeautifulSoup
-import pandas as pd
-from sqlalchemy import create_engine, text
 
-# Configuración del logging
+import pandas as pd
+import requests
+from airflow.providers.standard.operators.empty import EmptyOperator
+from airflow.providers.standard.operators.python import PythonOperator
+from airflow.sdk import DAG
+from bs4 import BeautifulSoup
+from sqlalchemy import text
+
+from utils.connections import (
+    crear_bucket_si_no_existe,
+    get_minio_client,
+    get_postgres_engine,
+)
+from utils.layer import ejecutar_ddl
+
 log = logging.getLogger(__name__)
 
 # URL de la página de Whale Alert a scrapear
@@ -23,119 +39,85 @@ SOURCE = "whale_alert"
 DATASET = "whale_alerts_limits"
 FILENAME = "whale_alerts_limits.html"
 
-# PostgreSQL
-TARGET_SCHEMA = "staging"
+# PostgreSQL (la tabla se crea con ddl/postgres_dw/15_whale_alert.sql)
+TARGET_SCHEMA = "bronze"
 TABLE_NAME = "whale_alerts_limits"
 
 
-
 def extract(**context) -> str:
+    """Descarga el HTML, lo sube a MinIO y devuelve la key (ruta) del archivo."""
     log.info("Solicitando datos a %s", URL_WHALE_ALERT)
-    response = requests.get(URL_WHALE_ALERT)
+    response = requests.get(URL_WHALE_ALERT, timeout=30)
+    # Si la página responde con error (4xx/5xx) la tarea falla y no guardamos basura
+    response.raise_for_status()
 
-    log.info("Resultado de la request de la API: %s", response.status_code)
-
-    buffer = io.BytesIO(response.content)
-
+    # Ruta particionada por fecha: source=.../dataset=.../year=2026/month=09/<fecha>_archivo.html
     extraction_ts = context["logical_date"]
     key = (
         f"source={SOURCE}/dataset={DATASET}/year={extraction_ts:%Y}/month={extraction_ts:%m}/"
         f"{extraction_ts:%Y%m%dT%H%M%S}_{FILENAME}"
     )
-    log.info("Filename path en MinIO: %s", key)
 
-    # Carga del archivo en el bucket landing de MinIO
-    minio = boto3.client(
-        "s3",
-        endpoint_url=os.getenv("MINIO_ENDPOINT", "http://minio:9000"),
-        aws_access_key_id=os.getenv("MINIO_ACCESS_KEY", "admin"),
-        aws_secret_access_key=os.getenv("MINIO_SECRET_KEY", "password"),
-        region_name=os.getenv("MINIO_REGION", "us-east-1"),
-    )
-
-    # Verificar si el bucket existe, si no, crearlo
-    try:
-        minio.head_bucket(Bucket=BUCKET)
-        log.info("Bucket '%s' ya existe", BUCKET)
-    except minio.exceptions.ClientError:
-        log.info("Bucket '%s' no existe, creandolo", BUCKET)
-        minio.create_bucket(Bucket=BUCKET)
-
-    # Carga del archivo en MinIO
-    minio.upload_fileobj(buffer, BUCKET, key)
+    minio = get_minio_client()
+    crear_bucket_si_no_existe(minio, BUCKET)
+    minio.upload_fileobj(io.BytesIO(response.content), BUCKET, key)
     log.info("Archivo subido a MinIO: bucket=%s key=%s", BUCKET, key)
 
+    # Lo que devuelve la función queda guardado en XCom
     return key
 
-def transform_and_load(**context):
-    # Recuperar la key (file path en MinIO) del archivo desde XCom
+
+def transform_and_load(**context) -> None:
+    """Lee el HTML desde MinIO, extrae la tabla y la carga en PostgreSQL."""
+    # Recuperar la key que devolvió la tarea extract
     key = context["ti"].xcom_pull(task_ids="extract")
-    log.info("Key recibida via XCom: %s", key)
+    extraction_ts = context["logical_date"]
 
-    # Leer el archivo desde MinIO
-    minio = boto3.client(
-        "s3",
-        endpoint_url=os.getenv("MINIO_ENDPOINT", "http://minio:9000"),
-        aws_access_key_id=os.getenv("MINIO_ACCESS_KEY", "admin"),
-        aws_secret_access_key=os.getenv("MINIO_SECRET_KEY", "password"),
-        region_name=os.getenv("MINIO_REGION", "us-east-1"),
-    )
-
-    # Descargar el archivo desde MinIO 
+    minio = get_minio_client()
     obj = minio.get_object(Bucket=BUCKET, Key=key)
-    # Leer el contenido del archivo y decodificar html a UTF-8
     html_content = obj["Body"].read().decode("utf-8")
-    log.info("Archivo leido desde MinIO: bucket=%s key=%s (%d bytes)", BUCKET, key, len(html_content))
+    log.info("Archivo leído desde MinIO: %s (%d bytes)", key, len(html_content))
 
-    # Parsear el contenido HTML usando BeautifulSoup
+    # Parsear el HTML: cada fila <tr> es una moneda
     soup = BeautifulSoup(html_content, "html.parser")
-
-    table = soup.find("table")
-    tbody = table.find("tbody")
-
-    rows =tbody.find_all("tr")
-    log.info("Filas encontradas en la tabla: %d", len(rows))
+    rows = soup.find("table").find("tbody").find_all("tr")
 
     data = []
     for row in rows:
+        # El nombre de la moneda está en el alt de la imagen (o en el texto del <th>)
         th = row.find("th", {"scope": "row"})
         img = th.find("img")
         coin_name = img["alt"].strip() if img else th.get_text(strip=True)
-        row_data = row.find_all("td")
-
-        # Crear un diccionario con los datos parseados (cada fila de la tabla)
-        json_data = {
-            "coin_name": coin_name,
-            "known": row_data[0].text.strip(),
-            "unknown": row_data[1].text.strip(),
-        }
-
-        # Agregar la fila parseada a la lista de datos
-        data.append(json_data)
-
+        cells = row.find_all("td")
+        data.append(
+            {
+                "coin_name": coin_name,
+                "known": cells[0].text.strip(),
+                "unknown": cells[1].text.strip(),
+            }
+        )
     log.info("Filas parseadas: %d", len(data))
 
-    # Crear un DataFrame de pandas a partir de los datos parseados
     df = pd.DataFrame(data)
-    # Agregar la columna de timestamp de extracción al DataFrame
-    df["extraction_ts"] = context["logical_date"]
+    df["extraction_ts"] = extraction_ts
 
-    # Crear la conexión a PostgreSQL usando SQLAlchemy
-    engine = create_engine(
-        f"postgresql://{os.getenv('POSTGRES_USER', 'admin')}:"
-        f"{os.getenv('POSTGRES_PASSWORD', 'admin123')}@"
-        f"{os.getenv('POSTGRES_HOST', 'postgres_db')}:"
-        f"{os.getenv('POSTGRES_PORT', '5432')}/"
-        f"{os.getenv('POSTGRES_DB', 'local_db')}"
-    )
+    # Crea la tabla si todavía no existe (por ejemplo, si la base se creó con una versión anterior)
+    ejecutar_ddl("15_whale_alert.sql")
 
-    # Carga de los datos en la tabla de PostgreSQL
-    log.info("Cargando %d filas en %s.%s", len(df), TARGET_SCHEMA, TABLE_NAME)
-    df.to_sql(TABLE_NAME, engine, schema=TARGET_SCHEMA, if_exists="append", index=False)
-    log.info("Carga en PostgreSQL completada: %s.%s", TARGET_SCHEMA, TABLE_NAME)
+    engine = get_postgres_engine()
+    # Carga idempotente: si la tarea se reintenta, primero borramos lo cargado para esa fecha
+    with engine.begin() as conn:
+        conn.execute(
+            text(f"DELETE FROM {TARGET_SCHEMA}.{TABLE_NAME} WHERE extraction_ts = :ts"),
+            {"ts": extraction_ts},
+        )
+        df.to_sql(
+            TABLE_NAME, conn, schema=TARGET_SCHEMA, if_exists="append", index=False
+        )
     engine.dispose()
+    log.info("Cargadas %d filas en %s.%s", len(df), TARGET_SCHEMA, TABLE_NAME)
 
-# Definición del DAG de Airflow
+
 with DAG(
     dag_id="whale_alert",
     start_date=datetime.datetime(2026, 9, 1),
@@ -143,14 +125,11 @@ with DAG(
     catchup=False,
     schedule="@daily",
 ):
-
     start_task = EmptyOperator(task_id="start_task")
-
-    extract = PythonOperator(task_id="extract", python_callable=extract)
-
-    transform_and_load = PythonOperator(task_id="transform_and_load", python_callable=transform_and_load)
-
+    extract_task = PythonOperator(task_id="extract", python_callable=extract)
+    transform_and_load_task = PythonOperator(
+        task_id="transform_and_load", python_callable=transform_and_load
+    )
     end_task = EmptyOperator(task_id="end_task")
 
-    start_task >> extract >> transform_and_load >> end_task
-
+    start_task >> extract_task >> transform_and_load_task >> end_task
