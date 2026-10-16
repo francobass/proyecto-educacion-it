@@ -1,0 +1,2 @@
+# Hace que los scripts .sh usen siempre el salto de línea de Linux (LF), aunque el repositorio se clone en Windows. Esto evita que los scripts fallen al ejecutarse dentro de Docker.
+*.sh text eol=lf
