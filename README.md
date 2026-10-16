@@ -71,8 +71,7 @@ pip install -r requirements.txt
 
 ## Código limpio y pre-commit
 
-El código se lee muchas más veces de las que se escribe. Un código limpio (formato uniforme, nombres claros,
-sin imports sin usar ni restos de depuración) es más fácil de revisar, de mantener y de entregar a otra persona.
+El código se lee muchas más veces de las que se escribe. Un código limpio (formato uniforme, nombres claros, errores, orden, etc) es más fácil de revisar, de mantener y de trabajar por terceros.
 En un equipo, además, evita que los *pull requests* se llenen de cambios de espacios o de orden de imports
 y deja la revisión para lo importante: la lógica.
 
