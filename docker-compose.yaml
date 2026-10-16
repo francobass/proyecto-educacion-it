@@ -16,96 +16,182 @@
 # under the License.
 #
 
-# Basic Airflow cluster configuration for CeleryExecutor with Redis and PostgreSQL.
+# =============================================================================
+# Plataforma de datos del curso (todo en un solo docker compose)
 #
-# WARNING: This configuration is for local development. Do not use it in a production deployment.
+#   - Airflow 3 (CeleryExecutor): orquesta los DAGs de la carpeta dags/
+#   - MinIO: data lake compatible con S3
+#   - PostgreSQL 18, dos servidores:
+#       postgres_airflow -> base airflow (metadatos) + base amn (sistema origen auxiliar)
+#       postgres_db      -> data warehouse local_db (bronze, silver, gold, integrador 2)
+#   - pgAdmin: interfaz web para consultar PostgreSQL
 #
-# This configuration supports basic configuration using environment variables or an .env file
-# The following variables are supported:
+# Uso:
+#   docker compose up -d      # levanta todo
+#   docker compose down       # apaga todo (los datos quedan en los volúmenes)
 #
-# AIRFLOW_IMAGE_NAME           - Docker image name used to run Airflow.
-#                                Default: apache/airflow:3.3.1
-# AIRFLOW_UID                  - User ID in Airflow containers
-#                                Default: 50000
-# AIRFLOW_PROJ_DIR             - Base path to which all the files will be volumed.
-#                                Default: .
-# Those configurations are useful mostly in case of standalone testing/running Airflow in test/try-out mode
+# ATENCIÓN: configuración para desarrollo local. No usar en producción.
 #
-# _AIRFLOW_WWW_USER_USERNAME   - Username for the administrator account (if requested).
-#                                Default: airflow
-# _AIRFLOW_WWW_USER_PASSWORD   - Password for the administrator account (if requested).
-#                                Default: airflow
-# _PIP_ADDITIONAL_REQUIREMENTS - Additional PIP requirements to add when starting all containers.
-#                                Use this option ONLY for quick checks. Installing requirements at container
-#                                startup is done EVERY TIME the service is started.
-#                                A better way is to build a custom image or extend the official image
-#                                as described in https://airflow.apache.org/docs/docker-stack/build.html.
-#                                Default: ''
-#
-# Feel free to modify this file to suit your needs.
+# Variables que se pueden definir en el archivo .env (ver .env.example):
+#   Todos los usuarios y contraseñas (Airflow, MinIO, PostgreSQL, pgAdmin).
+#   Si una variable no está en .env se usa el valor por defecto que figura en este archivo
+#   como ${VARIABLE:-default}.
+#   Extras opcionales:
+#     AIRFLOW_IMAGE_NAME - imagen de Airflow. Default: apache/airflow:3.3.1
+#     _PIP_ADDITIONAL_REQUIREMENTS - paquetes pip extra (se instalan en CADA arranque, sólo para pruebas)
+# =============================================================================
 ---
+# Configuración común a todos los servicios de Airflow (se reutiliza con <<: *airflow-common)
 x-airflow-common:
   &airflow-common
-  # In order to add custom dependencies or upgrade provider distributions you can use your extended image.
-  # Comment the image line, place your Dockerfile in the directory where you placed the docker-compose.yaml
-  # and uncomment the "build" line below, Then run `docker-compose build` to build the images.
   image: ${AIRFLOW_IMAGE_NAME:-apache/airflow:3.3.1}
-  # build: .
   env_file:
     - ${ENV_FILE_PATH:-.env}
+  # Cada AIRFLOW__SECCION__CLAVE pisa el valor de config/airflow.cfg
+  # (por eso allá dice LocalExecutor y sqlite, pero corre CeleryExecutor con Postgres)
   environment:
     &airflow-common-env
     AIRFLOW__CORE__EXECUTOR: CeleryExecutor
     AIRFLOW__CORE__AUTH_MANAGER: airflow.providers.fab.auth_manager.fab_auth_manager.FabAuthManager
-    AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://airflow:airflow@postgres/airflow
-    AIRFLOW__CELERY__RESULT_BACKEND: db+postgresql+psycopg2://airflow:airflow@postgres/airflow
+    # Base airflow (metadatos internos) en el servidor postgres_airflow
+    AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://${AIRFLOW_DB_USER:-airflow}:${AIRFLOW_DB_PASSWORD:-airflow}@postgres_airflow/${AIRFLOW_DB_NAME:-airflow}
+    AIRFLOW__CELERY__RESULT_BACKEND: db+postgresql+psycopg2://${AIRFLOW_DB_USER:-airflow}:${AIRFLOW_DB_PASSWORD:-airflow}@postgres_airflow/${AIRFLOW_DB_NAME:-airflow}
     AIRFLOW__CELERY__BROKER_URL: redis://:@redis:6379/0
-    AIRFLOW__CORE__FERNET_KEY: ${FERNET_KEY}
+    # Tareas en paralelo por worker (default 16). Cada tarea usa memoria (pandas):
+    # con 4 el stack entra en una PC con 8 GB asignados a Docker.
+    AIRFLOW__CELERY__WORKER_CONCURRENCY: '4'
+    AIRFLOW__CORE__FERNET_KEY: ${FERNET_KEY:-}
     AIRFLOW__CORE__DAGS_ARE_PAUSED_AT_CREATION: 'true'
     AIRFLOW__CORE__LOAD_EXAMPLES: 'false'
     AIRFLOW__CORE__EXECUTION_API_SERVER_URL: 'http://airflow-apiserver:8080/execution/'
     AIRFLOW__API_AUTH__JWT_SECRET: ${AIRFLOW__API_AUTH__JWT_SECRET:-airflow_jwt_secret}
     AIRFLOW__API_AUTH__JWT_ISSUER: ${AIRFLOW__API_AUTH__JWT_ISSUER:-airflow}
-    # yamllint disable rule:line-length
-    # Use simple http server on scheduler for health checks
-    # See https://airflow.apache.org/docs/apache-airflow/stable/administration-and-deployment/logging-monitoring/check-health.html#scheduler-health-check-server
-    # yamllint enable rule:line-length
     AIRFLOW__SCHEDULER__ENABLE_HEALTH_CHECK: 'true'
-    # WARNING: Use _PIP_ADDITIONAL_REQUIREMENTS option ONLY for a quick checks
-    # for other purpose (development, test and especially production usage) build/extend Airflow image.
     _PIP_ADDITIONAL_REQUIREMENTS: ${_PIP_ADDITIONAL_REQUIREMENTS:-}
-    # The following line can be used to set a custom config file, stored in the local config folder
     AIRFLOW_CONFIG: '/opt/airflow/config/airflow.cfg'
+    # Conexiones que usan los DAGs (ver plugins/utils/connections.py).
+    # Dentro de la red de docker cada servicio se llama por su nombre (minio, postgres_db).
+    MINIO_ENDPOINT: http://minio:9000
+    POSTGRES_HOST: postgres_db
+    POSTGRES_PORT: '5432'
+    POSTGRES_DB: ${POSTGRES_DB:-local_db}
+    POSTGRES_USER: ${POSTGRES_USER:-admin}
+    POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-admin123}
+    MINIO_ACCESS_KEY: ${MINIO_ACCESS_KEY:-admin}
+    MINIO_SECRET_KEY: ${MINIO_SECRET_KEY:-password}
   volumes:
+    # Carpetas locales que se comparten con los contenedores
     - ${AIRFLOW_PROJ_DIR:-.}/dags:/opt/airflow/dags
     - ${AIRFLOW_PROJ_DIR:-.}/logs:/opt/airflow/logs
     - ${AIRFLOW_PROJ_DIR:-.}/config:/opt/airflow/config
     - ${AIRFLOW_PROJ_DIR:-.}/plugins:/opt/airflow/plugins
+    # Los DAGs AMN ejecutan los CREATE TABLE de ddl/postgres_dw antes de cargar
+    - ${AIRFLOW_PROJ_DIR:-.}/ddl:/opt/airflow/ddl
   user: "${AIRFLOW_UID:-50000}:0"
   depends_on:
     &airflow-common-depends-on
     redis:
       condition: service_healthy
-    postgres:
+    postgres_airflow:
       condition: service_healthy
+    postgres_db:
+      condition: service_healthy
+    minio:
+      condition: service_started
 
 services:
-  postgres:
-    image: postgres:16
+  # ---------------------------------------------------------------------------
+  # Servicios de datos (los que usan los alumnos)
+  # ---------------------------------------------------------------------------
+
+  # MinIO: data lake (S3). API en :9000, consola web en http://localhost:9001
+  # MinIO dejó de publicar la imagen oficial minio/minio; pgsty/minio es una versión
+  # mantenida por la comunidad (Pigsty), con los mismos comandos y la consola web completa.
+  minio:
+    image: pgsty/minio:latest
+    container_name: minio
+    ports:
+      - "9000:9000"   # API S3
+      - "9001:9001"   # Consola web
     environment:
-      POSTGRES_USER: airflow
-      POSTGRES_PASSWORD: airflow
-      POSTGRES_DB: airflow
+      MINIO_ROOT_USER: ${MINIO_ACCESS_KEY:-admin}
+      MINIO_ROOT_PASSWORD: ${MINIO_SECRET_KEY:-password}
     volumes:
-      - postgres-db-volume:/var/lib/postgresql/data
+      - minio_data:/data
+    command: server /data --console-address ":9001"
+
+  # PostgreSQL 18 del data warehouse: base local_db, puerto 5432 (credenciales en .env).
+  # Esquemas: bronze (AMN y whale alert), silver y gold (AMN), public (integrador 2).
+  # Al crear el volumen por primera vez ejecuta los scripts de ddl/postgres_dw en orden alfabético.
+  postgres_db:
+    image: postgres:18
+    container_name: postgres_db
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-admin}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-admin123}
+      POSTGRES_DB: ${POSTGRES_DB:-local_db}
+    ports:
+      - "5432:5432"
+    volumes:
+      # Desde Postgres 18 el volumen se monta en /var/lib/postgresql (no en .../data)
+      - postgres_dw_data:/var/lib/postgresql
+      - ./ddl/postgres_dw:/docker-entrypoint-initdb.d:ro
     healthcheck:
-      test: ["CMD", "pg_isready", "-U", "airflow"]
+      test: ["CMD", "pg_isready", "-U", "${POSTGRES_USER:-admin}", "-d", "${POSTGRES_DB:-local_db}"]
       interval: 10s
       retries: 5
       start_period: 5s
 
+  # pgAdmin: http://localhost:5050 (credenciales en .env).
+  # Servidores para registrar (puerto 5432 en ambos, dentro de la red de docker):
+  #   host "postgres_db"      -> data warehouse
+  #   host "postgres_airflow" -> metadatos de Airflow y base origen amn
+  pgadmin:
+    image: dpage/pgadmin4
+    container_name: pgadmin
+    environment:
+      PGADMIN_DEFAULT_EMAIL: ${PGADMIN_EMAIL:-admin@admin.com}
+      PGADMIN_DEFAULT_PASSWORD: ${PGADMIN_PASSWORD:-admin123}
+    ports:
+      - "5050:80"
+    depends_on:
+      - postgres_db
+    volumes:
+      - pgadmin_data:/var/lib/pgadmin
+
+  # ---------------------------------------------------------------------------
+  # Airflow
+  # ---------------------------------------------------------------------------
+
+  # PostgreSQL 18 de Airflow (puerto 5433 desde la PC):
+  #   - airflow: metadatos internos (no tocar)
+  #   - amn:     base auxiliar que simula el sistema origen de AMN (usuario AMN_DB_USER)
+  # Al crear el volumen ejecuta ddl/postgres_airflow (crea el usuario y la base amn).
+  postgres_airflow:
+    image: postgres:18
+    container_name: postgres_airflow
+    environment:
+      POSTGRES_USER: ${AIRFLOW_DB_USER:-airflow}
+      POSTGRES_PASSWORD: ${AIRFLOW_DB_PASSWORD:-airflow}
+      POSTGRES_DB: ${AIRFLOW_DB_NAME:-airflow}
+      # Los usa ddl/postgres_airflow/01_create_amn_db.sh
+      AMN_DB_USER: ${AMN_DB_USER:-amn}
+      AMN_DB_PASSWORD: ${AMN_DB_PASSWORD:-amn123}
+      AMN_DB_NAME: ${AMN_DB_NAME:-amn}
+    ports:
+      - "5433:5432"
+    volumes:
+      - postgres_airflow_data:/var/lib/postgresql
+      - ./ddl/postgres_airflow:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test: ["CMD", "pg_isready", "-U", "${AIRFLOW_DB_USER:-airflow}", "-d", "${AIRFLOW_DB_NAME:-airflow}"]
+      interval: 10s
+      retries: 5
+      start_period: 5s
+
+  # Cola de mensajes entre el scheduler y los workers de Celery
   redis:
-    # Redis is limited to 7.2-bookworm due to licencing change
+    # Redis queda en 7.2-bookworm por el cambio de licencia
     # https://redis.io/blog/redis-adopts-dual-source-available-licensing/
     image: redis:7.2-bookworm
     expose:
@@ -117,6 +203,7 @@ services:
       retries: 50
       start_period: 30s
 
+  # Interfaz web y API de Airflow: http://localhost:8080 (credenciales en .env)
   airflow-apiserver:
     <<: *airflow-common
     command: api-server
@@ -133,6 +220,7 @@ services:
       airflow-init:
         condition: service_completed_successfully
 
+  # Decide qué tareas ejecutar y cuándo
   airflow-scheduler:
     <<: *airflow-common
     command: scheduler
@@ -147,6 +235,7 @@ services:
       airflow-init:
         condition: service_completed_successfully
 
+  # Lee los archivos de dags/ y detecta errores de importación
   airflow-dag-processor:
     <<: *airflow-common
     command: dag-processor
@@ -161,6 +250,7 @@ services:
       airflow-init:
         condition: service_completed_successfully
 
+  # Ejecuta las tareas (el código Python de los DAGs corre acá)
   airflow-worker:
     <<: *airflow-common
     command: celery worker
@@ -173,8 +263,8 @@ services:
       start_period: 30s
     environment:
       <<: *airflow-common-env
-      # Required to handle warm shutdown of the celery workers properly
-      # See https://airflow.apache.org/docs/docker-stack/entrypoint.html#signal-propagation
+      # Necesario para apagar bien los workers de Celery
+      # https://airflow.apache.org/docs/docker-stack/entrypoint.html#signal-propagation
       DUMB_INIT_SETSID: "0"
     depends_on:
       <<: *airflow-common-depends-on
@@ -183,6 +273,7 @@ services:
       airflow-init:
         condition: service_completed_successfully
 
+  # Maneja las tareas "deferrable" (esperas asíncronas)
   airflow-triggerer:
     <<: *airflow-common
     command: triggerer
@@ -197,6 +288,8 @@ services:
       airflow-init:
         condition: service_completed_successfully
 
+  # Se ejecuta una sola vez al arrancar: migra la base de Airflow, crea el usuario
+  # admin y ajusta permisos de las carpetas compartidas.
   airflow-init:
     <<: *airflow-common
     entrypoint: /bin/bash
@@ -255,6 +348,16 @@ services:
         echo "Airflow version:"
         /entrypoint airflow version
         echo
+        echo "Creando las conexiones de Airflow amn_origen y postgres_dw (se ven en Admin > Connections):"
+        echo
+        # Se borran y se vuelven a crear para que siempre tomen los valores del .env
+        /entrypoint bash -c '
+          airflow connections delete amn_origen >/dev/null 2>&1 || true
+          airflow connections add amn_origen --conn-uri "postgresql://${AMN_DB_USER:-amn}:${AMN_DB_PASSWORD:-amn123}@postgres_airflow:5432/${AMN_DB_NAME:-amn}"
+          airflow connections delete postgres_dw >/dev/null 2>&1 || true
+          airflow connections add postgres_dw --conn-uri "postgresql://${POSTGRES_USER:-admin}:${POSTGRES_PASSWORD:-admin123}@postgres_db:5432/${POSTGRES_DB:-local_db}"
+        '
+        echo
         echo "Files in shared volumes:"
         echo
         ls -la /opt/airflow/{logs,dags,plugins,config}
@@ -289,6 +392,7 @@ services:
       _PIP_ADDITIONAL_REQUIREMENTS: ''
     user: "0:0"
 
+  # Consola de Airflow para debug: docker compose run --rm airflow-cli <comando>
   airflow-cli:
     <<: *airflow-common
     profiles:
@@ -296,7 +400,7 @@ services:
     environment:
       <<: *airflow-common-env
       CONNECTION_CHECK_MAX_COUNT: "0"
-    # Workaround for entrypoint issue. See: https://github.com/apache/airflow/issues/16252
+    # Workaround del entrypoint. Ver: https://github.com/apache/airflow/issues/16252
     command:
       - bash
       - -c
@@ -304,9 +408,8 @@ services:
     depends_on:
       <<: *airflow-common-depends-on
 
-  # You can enable flower by adding "--profile flower" option e.g. docker-compose --profile flower up
-  # or by explicitly targeted on the command line e.g. docker-compose up flower.
-  # See: https://docs.docker.com/compose/profiles/
+  # Flower: monitor de Celery en http://localhost:5555
+  # Se activa con: docker compose --profile flower up -d
   flower:
     <<: *airflow-common
     command: celery flower
@@ -325,5 +428,9 @@ services:
       airflow-init:
         condition: service_completed_successfully
 
+# Volúmenes: acá quedan guardados los datos aunque se borren los contenedores
 volumes:
-  postgres-db-volume:
+  postgres_airflow_data:  # PostgreSQL de Airflow (bases airflow y amn)
+  postgres_dw_data:       # PostgreSQL del data warehouse (base local_db)
+  pgadmin_data:        # configuración de pgAdmin
+  minio_data:          # archivos del data lake
