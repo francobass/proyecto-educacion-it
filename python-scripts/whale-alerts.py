@@ -1,7 +1,7 @@
 """Scraping de Whale Alert y guardado local en CSV, JSON y Parquet.
 
 Script de práctica (sin Airflow ni MinIO). Ejecutar desde la raíz del repo:
-    python whale-alerts.py
+    python python-scripts/whale-alerts.py
 Los archivos quedan en la carpeta data/.
 """
 
