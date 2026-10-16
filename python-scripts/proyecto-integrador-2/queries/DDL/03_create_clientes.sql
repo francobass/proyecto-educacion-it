@@ -2,7 +2,7 @@
 CREATE TABLE IF NOT EXISTS Clientes (
     ID INTEGER PRIMARY KEY,
     Provincia VARCHAR(100),
-    Nombre_y_Apellido VARCHAR(200) NOT NULL,
+    Nombre_y_Apellido VARCHAR(200), -- el CSV trae nombres vacíos (dato crudo)
     Domicilio VARCHAR(500),
     Telefono VARCHAR(50),
     Edad INTEGER,
