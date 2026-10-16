@@ -8,6 +8,6 @@ CREATE TABLE IF NOT EXISTS Venta (
     IdSucursal INTEGER NOT NULL,
     IdEmpleado INTEGER NOT NULL,
     IdProducto INTEGER NOT NULL,
-    Precio DECIMAL(10,2) NOT NULL,
-    Cantidad INTEGER NOT NULL
+    Precio DECIMAL(10,2),       -- puede venir vacío en el CSV (dato crudo)
+    Cantidad INTEGER            -- puede venir vacía en el CSV (dato crudo)
 );

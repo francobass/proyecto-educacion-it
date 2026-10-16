@@ -15,9 +15,7 @@ from datetime import datetime
 
 from airflow.providers.common.sql.operators.sql import SQLExecuteQueryOperator
 from airflow.providers.standard.operators.python import PythonOperator
-from airflow.sdk import DAG
-from airflow.timetables.interval import CronDataIntervalTimetable
-
+from airflow.sdk import DAG, CronDataIntervalTimetable
 from utils.assets import SILVER_BEGINV
 from utils.layer import (
     CONN_DW,
@@ -39,10 +37,12 @@ def cargar_bronze(key: str, **context) -> int:
     return datalake_a_bronze("amn_beginv", key=key, context=context)
 
 
-# Limpieza bronze -> silver. Airflow completa %(created_by)s con "airflow__<dag_id>__<run_id>".
+# Limpieza bronze -> silver. Airflow renderiza CREATED_BY ("airflow__<dag_id>__<run_id>") porque
+# parameters acepta plantillas; después psycopg2 pone ese valor en %(created_by)s.
 UPSERT_SILVER = """
 -- 1) ultimas: las filas que cargó esta corrida en bronze, numeradas por clave de silver.
---    ROW_NUMBER() = 1 es la carga más nueva de cada clave (si el día se cargó más de una vez).
+--    ROW_NUMBER() = 1 es la carga más nueva de cada clave (por ejemplo si el día se cargó más de una vez).
+--    Es imprescindible: con una clave repetida, ON CONFLICT falla con "cannot affect row a second time".
 WITH ultimas AS (
     SELECT
         *,
@@ -78,6 +78,7 @@ SELECT
 FROM ultimas
 WHERE rn = 1
   -- Descartamos filas sin clave o con valores imposibles
+  -- (NULL >= 0 no es verdadero: una medida NULL también descarta la fila)
   AND inventoryid IS NOT NULL
   AND onhand >= 0 AND price >= 0
 -- Upsert: si la clave ya existe en silver, se actualiza en vez de duplicarse
@@ -107,6 +108,8 @@ with DAG(
     start_date=datetime(2016, 1, 1),
     end_date=datetime(2016, 1, 1),
     schedule=CronDataIntervalTimetable("@daily", timezone="UTC"),
+    # Obligatorio: con catchup=False sólo se agenda el intervalo más reciente,
+    # que cae después de end_date, y el DAG nunca corre.
     catchup=True,
 ):
     extraer_task = PythonOperator(
@@ -126,7 +129,9 @@ with DAG(
         conn_id=CONN_DW,
         sql=UPSERT_SILVER,
         parameters={"created_by": CREATED_BY},
-        outlets=[SILVER_BEGINV],  # al terminar bien "actualiza" el asset: dispara el DAG gold_amn_purchases_model
+        outlets=[
+            SILVER_BEGINV
+        ],  # al terminar bien "actualiza" el asset: dispara el DAG gold_amn_purchases_model
     )
 
     extraer_task >> datalake_a_bronze_task >> bronze_a_silver_task

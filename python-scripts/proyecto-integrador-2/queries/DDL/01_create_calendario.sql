@@ -1,3 +1,4 @@
+-- Calendario: una fila por día (dimensión de tiempo)
 CREATE TABLE IF NOT EXISTS Calendario (
     IdFecha INTEGER PRIMARY KEY,
     fecha DATE NOT NULL,
